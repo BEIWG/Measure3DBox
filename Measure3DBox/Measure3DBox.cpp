@@ -6,6 +6,7 @@
 
 #include "stdafx.h"
 #include <iostream>
+#include <algorithm>
 #include "opencv2/imgproc.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/highgui.hpp"
@@ -13,19 +14,19 @@
 
 #define DEBUG   1
 #define GET_REF 0
-#define REF_DISTDANCE   2000
+#define REF_DISTDANCE   2000.0
 #define MAX_DEPTH       4000
 #define SAMPLE_READ_WAIT_TIMEOUT        2000 //2000ms
-#define INTRINSIC_FILE  "camera.yml"
+#define INTRINSIC_FILE  "camera.yaml"
 
 using namespace std;
 using namespace cv;
 using namespace openni;
 
 struct Box{
-        short width;
-        short length;
-        short height;
+        double width;
+        double length;
+        double height;
 };
 
 /**************************************************
@@ -45,7 +46,8 @@ vector<Point> --> 0:left_up, 1:right_up, 2:left_down, 3:right_down
 static void SortRectPoints(vector<Point> &approx)
 {
         Point left_up, left_down, right_up, right_down;
-        unsigned int max = 0, min = 0xffff, max_index = 0, min_index = 0;
+        int max = 0, min = 0x7fff, max_index = 0, min_index = 0;
+        int right_up_x =0, right_up_index = 0;
 
         //find left_up and right_down point
         for (auto i = 0; i < approx.size(); i++)
@@ -76,21 +78,22 @@ static void SortRectPoints(vector<Point> &approx)
                 {
                         if (max > approx.at(i).x)
                         {
-                                right_up = approx.at(max_index);
+                                right_up = approx.at(right_up_index);
                                 left_down = approx.at(i);
                         }
                         else
                         {
                                 right_up = approx.at(i);
-                                left_down = approx.at(max_index);
+                                left_down = approx.at(right_up_index);
                         }
+
                         break;
                 }
 
-                max = approx.at(i).x;
-                max_index = i;
+                right_up_x = approx.at(i).x;
+                right_up_index = i;
         }
-
+        
         approx.clear();
         approx.push_back(left_up);
         approx.push_back(right_up);
@@ -107,8 +110,29 @@ static double angle(Point pt1, Point pt2, Point pt0)
         return (dx1*dx2 + dy1*dy2) / sqrt((dx1*dx1 + dy1*dy1)*(dx2*dx2 + dy2*dy2) + 1e-10);
 }
 
-static void ConvertUnitPixelToMM(Mat intrinsic, int &w, int &h)
+/*
+ According to the principle of pinhole projection, convert the object size in pixel unit to 
+ mm unit, essentially, it is Coordinate transformation: opencv -> world
+*/
+static void ConvertUnitPixelToMM(Mat intrinsic, short width, short length, double depth, Box &box)
 {
+        double fx, fy;
+        
+        fx = intrinsic.at<double>(0, 0);
+        fy = intrinsic.at<double>(1, 1);
+        
+        box.width = depth*width / fx;
+        box.length = depth*length / fy;
+        box.height = REF_DISTDANCE - depth;
+        
+        /*Normally, width is bigger than length*/
+        if (box.width < box.length)
+        {
+                double tmp;
+                tmp = box.width;
+                box.width = box.length;
+                box.length = tmp;
+        }
 
 }
 
@@ -126,7 +150,7 @@ static void drawSquares(Mat& image, const vector<vector<Point> >& squares)
         }
 }
 
-bool Measure3DBox(Mat ref, Mat depth_frame, VideoFrameRef frame, Box &box)
+bool Measure3DBox(Mat cameraMatrix, Mat ref, Mat depth_frame, VideoFrameRef frame, Box &box)
 {
         Mat dst;
         Mat diff;
@@ -148,13 +172,12 @@ bool Measure3DBox(Mat ref, Mat depth_frame, VideoFrameRef frame, Box &box)
         for (size_t i = 0; i < contours.size(); i++)
         {
                 approxPolyDP(Mat(contours[i]), approx, arcLength(Mat(contours[i]), true)*0.04, true);
-                if (DEBUG)
-                {
-                        printf("appros.size = %d\n", approx.size());
-                        printf("approx.area = %f\n", contourArea(Mat(approx)));
-                        printf("is contourconvex %d\n", isContourConvex(Mat(approx)));
-                }
-
+                // square contours should have 4 vertices after approximation
+                // relatively large area (to filter out noisy contours)
+                // and be convex.
+                // Note: absolute value of an area is used because
+                // area may be positive or negative - in accordance with the
+                // contour orientation
                 if (approx.size() == 4 && fabs(contourArea(Mat(approx))) > 1000 &&
                         isContourConvex(Mat(approx)))
                 {
@@ -176,13 +199,7 @@ bool Measure3DBox(Mat ref, Mat depth_frame, VideoFrameRef frame, Box &box)
 
                         if (squares.size() == 0)
                                 continue;
-                        
-                        SortRectPoints(approx);
-                        /********************************************************************
-                        *calc rect width and heigth in opencv coordinate
-                        *width = {(right_up - left_up) + (right_down - left_down)} / 2
-                        *height = {(left_down - left_up) + (right_down - right_up)} / 2
-                        *********************************************************************/
+
                         if (DEBUG)
                         {
                                 for (auto jj = 0; jj < approx.size(); jj++)
@@ -192,54 +209,43 @@ bool Measure3DBox(Mat ref, Mat depth_frame, VideoFrameRef frame, Box &box)
                         }
 
                         //calculate box width and heith in opencv coordinate, unit is pixels
-                        Point left_up = approx.at(0);
-                        Point left_down = approx.at(2);
-                        Point right_up = approx.at(1);
-                        Point right_down = approx.at(3);
+                        int distance[4];
+                        distance[0] = sqrt(abs(approx.at(0).x - approx.at(1).x)*abs(approx.at(0).x - approx.at(1).x) + 
+                                abs(approx.at(0).y - approx.at(1).y)*abs(approx.at(0).y - approx.at(1).y));
 
-                        int width = ((right_up.x - left_up.x) + (right_down.x - left_down.x)) / 2;
-                        int length = ((left_down.y - left_up.y) + (right_down.y - right_up.y)) / 2;
+                        distance[1] = sqrt(abs(approx.at(1).x - approx.at(2).x)*abs(approx.at(1).x - approx.at(2).x) +
+                                abs(approx.at(1).y - approx.at(2).y)*abs(approx.at(1).y - approx.at(2).y));
 
-                        if (width < length)
-                        {
-                                int temp = width;
-                                width = length;
-                                length = temp;
-                        }
+                        distance[2] = sqrt(abs(approx.at(2).x - approx.at(3).x)*abs(approx.at(2).x - approx.at(3).x) +
+                                abs(approx.at(2).y - approx.at(3).y)*abs(approx.at(2).y - approx.at(3).y));
+
+                        distance[3] = sqrt(abs(approx.at(0).x - approx.at(3).x)*abs(approx.at(0).x - approx.at(3).x) +
+                                abs(approx.at(0).y - approx.at(3).y)*abs(approx.at(0).y - approx.at(3).y));
+
+                        sort(distance, distance + 4);
+
+                        double width = (distance[0] + distance[1]) / 2.0;
+                        double length = (distance[2] + distance[3]) / 2.0;
 
                         //calculate depth, unit is mm
-                        //sampling four point at box plan and calculate average value
-                        /*******************************************************************
-                        -----------------------
-                        |                     |
-                        |--------1------2-----|
-                        |                     |
-                        |--------3-------4----|
-                        |                     |
-                        |---------------------|
-                        ********************************************************************/
-                        int sampling_x_local[2], sampling_y_local[2];
-                        sampling_x_local[0] = left_up.x + (right_up.x - left_up.x) / 3;
-                        sampling_x_local[1] = left_up.x + (right_up.x - left_up.x) * 2 / 3;
-
-                        sampling_y_local[0] = left_up.y + (left_down.y - left_up.y) / 3;
-                        sampling_y_local[1] = left_up.y + (left_down.y - left_up.y) * 2 / 3;
+                        RotatedRect rect = minAreaRect(approx);
+                        
+                        if (DEBUG)
+                        {
+                                Point2f P[4];
+                                rect.points(P);
+                                for (int j = 0; j <= 3; j++)
+                                {
+                                        line(depth_frame, P[j], P[(j + 1) % 4], Scalar(255), 2);
+                                }
+                        }
 
                         DepthPixel* pDepth = (DepthPixel*)frame.getData();
-                        int depth = 0;
-                        depth += pDepth[sampling_x_local[0] + sampling_y_local[0] * frame.getWidth()];
-                        depth += pDepth[sampling_x_local[0] + sampling_y_local[1] * frame.getWidth()];
-                        depth += pDepth[sampling_x_local[1] + sampling_y_local[0] * frame.getWidth()];
-                        depth += pDepth[sampling_x_local[1] + sampling_y_local[1] * frame.getWidth()];
-                        depth /= 4;
+                        double depth = 0;
+                        int sampling_local = rect.center.x + rect.center.y * frame.getWidth();
+                        depth = pDepth[sampling_local];
 
-                        int height = REF_DISTDANCE - depth;
-
-                        //ConvertUnitPixelToMM()
-
-                        box.width = width;
-                        box.length = length;
-                        box.height = height;
+                        ConvertUnitPixelToMM(cameraMatrix, width, length, depth, box);
                         
                         isFound = true;
                 }
@@ -252,6 +258,7 @@ bool Measure3DBox(Mat ref, Mat depth_frame, VideoFrameRef frame, Box &box)
                 imshow("diff", diff);
                 imshow("dst", dst);
                 imshow("ref", ref);
+                imshow("depth_frame", depth_frame);
 
                 waitKey(10);
         }
@@ -272,18 +279,17 @@ int _tmain(int argc, _TCHAR* argv[])
         }
         
         //Read camera intrinsic file
-        FileStorage fs(string(INTRINSIC_FILE), FileStorage::READ);
+        FileStorage fs;
+        string filename = INTRINSIC_FILE;
+        fs.open(filename, FileStorage::READ);
         if (!fs.isOpened()) {
-                printf("Load %d Failed...\n", INTRINSIC_FILE);
+                printf("Load %s Failed...\n", INTRINSIC_FILE);
                 return -1;
         }
 
-        Mat cameraMatrix, distCoeffs;
+        Mat cameraMatrix;
         fs["camera_matrix"] >> cameraMatrix;
-        fs["distortion_coefficients"] >> distCoeffs;
-        cout << cameraMatrix << endl;
-        cout << distCoeffs << endl;
-
+        
         Status rc = OpenNI::initialize();
         if (rc != STATUS_OK)
         {
@@ -354,8 +360,8 @@ int _tmain(int argc, _TCHAR* argv[])
                         continue;
                 }
 
-                if (Measure3DBox(ref, depth_frame, frame, box))
-                        printf("###BOX width = %d, length = %d, height = %d\n", box.width, box.length, box.height);
+                if (Measure3DBox(cameraMatrix, ref, depth_frame, frame, box))
+                        printf("BOX width = %f, length = %f, height = %f\n", box.width, box.length, box.height);
                 else
                         printf("No Box found...\n");
         }
