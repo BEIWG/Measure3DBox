@@ -1,6 +1,6 @@
 // Measure3DBox.cpp : Defines the entry point for the console application.
 //
-//author：CuiYongTai
+//author：cuiyongtai
 //Emal: cuiyt@beiwg.com
 
 
@@ -14,8 +14,9 @@
 
 #define DEBUG   1
 #define GET_REF 0
-#define REF_DISTDANCE   2000.0
+#define REF_DISTDANCE   1237.0
 #define MAX_DEPTH       4000
+#define MIN_DEPHT       500
 #define SAMPLE_READ_WAIT_TIMEOUT        2000 //2000ms
 #define INTRINSIC_FILE  "camera.yaml"
 
@@ -113,16 +114,21 @@ static double angle(Point pt1, Point pt2, Point pt0)
 /*
  According to the principle of pinhole projection, convert the object size in pixel unit to 
  mm unit, essentially, it is Coordinate transformation: opencv -> world
+ D'/D = F/(H - F)
+ as D' is object in image, D is object, F is focal length, H is the distance from object to camera
 */
 static void ConvertUnitPixelToMM(Mat intrinsic, short width, short length, double depth, Box &box)
 {
-        double fx, fy;
+        double f, fx, fy;
         
+        double pixel_size = 5.2 * 1e-3;//MT9M001 PIXEL SIZE unit mm
         fx = intrinsic.at<double>(0, 0);
         fy = intrinsic.at<double>(1, 1);
         
-        box.width = depth*width / fx;
-        box.length = depth*length / fy;
+        
+        f = (fx*pixel_size + fy*pixel_size) / 2;
+        box.width = (depth - f)*width / f * pixel_size;
+        box.length = (depth - f)*length / f * pixel_size;
         box.height = REF_DISTDANCE - depth;
         
         /*Normally, width is bigger than length*/
@@ -150,7 +156,7 @@ static void drawSquares(Mat& image, const vector<vector<Point> >& squares)
         }
 }
 
-bool Measure3DBox(Mat cameraMatrix, Mat ref, Mat depth_frame, VideoFrameRef frame, Box &box)
+bool Measure3DBox(Mat cameraMatrix, Mat ref, Mat depth_frame, vector<VideoFrameRef> vframe, Box &box)
 {
         Mat dst;
         Mat diff;
@@ -160,7 +166,7 @@ bool Measure3DBox(Mat cameraMatrix, Mat ref, Mat depth_frame, VideoFrameRef fram
         //帧差  
         absdiff(depth_frame, ref, diff);
         //二值化
-        threshold(diff, diff, 0x15, 0xff, THRESH_BINARY);
+        threshold(diff, diff, 0x25, 0xff, THRESH_BINARY);
         //闭运算
         Mat element = getStructuringElement(MORPH_RECT, Size(90, 90));
         morphologyEx(diff, dst, MORPH_CLOSE, element);
@@ -200,14 +206,6 @@ bool Measure3DBox(Mat cameraMatrix, Mat ref, Mat depth_frame, VideoFrameRef fram
                         if (squares.size() == 0)
                                 continue;
 
-                        if (DEBUG)
-                        {
-                                for (auto jj = 0; jj < approx.size(); jj++)
-                                {
-                                        printf("point %d:x = %d, y = %d\n", jj, approx.at(jj).x, approx.at(jj).y);
-                                }
-                        }
-
                         //calculate box width and heith in opencv coordinate, unit is pixels
                         int distance[4];
                         distance[0] = sqrt(abs(approx.at(0).x - approx.at(1).x)*abs(approx.at(0).x - approx.at(1).x) + 
@@ -240,11 +238,23 @@ bool Measure3DBox(Mat cameraMatrix, Mat ref, Mat depth_frame, VideoFrameRef fram
                                 }
                         }
 
-                        DepthPixel* pDepth = (DepthPixel*)frame.getData();
-                        double depth = 0;
-                        int sampling_local = rect.center.x + rect.center.y * frame.getWidth();
-                        depth = pDepth[sampling_local];
+                        int depth = 0;
+                        for (auto n = 0; n < vframe.size(); n++)
+                        {
+                                VideoFrameRef frame = vframe.at(n);
+                                DepthPixel* pDepth = (DepthPixel*)frame.getData();
 
+                                int x = (int)round(rect.center.x);
+                                int y = (int)round(rect.center.y);
+     
+                                depth += pDepth[(int)(x + y * frame.getWidth())];
+                        }
+                        
+                        depth = depth / vframe.size();
+                        if (depth < MIN_DEPHT || depth > REF_DISTDANCE)
+                                return isFound;
+
+                       
                         ConvertUnitPixelToMM(cameraMatrix, width, length, depth, box);
                         
                         isFound = true;
@@ -256,8 +266,8 @@ bool Measure3DBox(Mat cameraMatrix, Mat ref, Mat depth_frame, VideoFrameRef fram
         {
                 // drawSquares(tmp, squares);
                 imshow("diff", diff);
-                imshow("dst", dst);
-                imshow("ref", ref);
+                //imshow("dst", dst);
+                //imshow("ref", ref);
                 imshow("depth_frame", depth_frame);
 
                 waitKey(10);
@@ -324,7 +334,8 @@ int _tmain(int argc, _TCHAR* argv[])
         }
 
         VideoFrameRef frame;
-
+        vector<VideoFrameRef> vframe;
+        int frame_num = 0;
         while (1)
         {
                 int changedStreamDummy;
@@ -359,11 +370,23 @@ int _tmain(int argc, _TCHAR* argv[])
                         waitKey(10);
                         continue;
                 }
-
-                if (Measure3DBox(cameraMatrix, ref, depth_frame, frame, box))
-                        printf("BOX width = %f, length = %f, height = %f\n", box.width, box.length, box.height);
+                
+                //use 5 frame data to calculate average for reducing measurement error
+                if (frame_num ++ < 5)
+                {
+                        vframe.push_back(frame);
+                        continue;
+                } 
                 else
-                        printf("No Box found...\n");
+                {
+                        if (Measure3DBox(cameraMatrix, ref, depth_frame, vframe, box))
+                                printf("BOX width = %f, length = %f, height = %f\n", box.width, box.length, box.height);
+                        else
+                                printf("No Box found...\n");
+
+                        vframe.clear();
+                        frame_num = 0;
+                }
         }
 
         depth.stop();
